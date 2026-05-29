@@ -537,6 +537,7 @@ fn merge_endpoint(
     existing.allow_encoded_slash |= incoming.allow_encoded_slash;
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
+    existing.advisor_proposed |= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -723,6 +724,12 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
 fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
     let mut seen: HashSet<String> = existing.iter().map(|binary| binary.path.clone()).collect();
     for binary in incoming {
+        if let Some(existing_binary) = existing.iter_mut().find(|item| item.path == binary.path) {
+            if !is_advisor_proposed_binary(binary) {
+                mark_user_declared_binary(existing_binary);
+            }
+            continue;
+        }
         if seen.insert(binary.path.clone()) {
             existing.push(binary.clone());
         }
@@ -778,8 +785,30 @@ fn dedup_strings(values: &mut Vec<String>) {
 }
 
 fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
-    let mut seen = HashSet::new();
-    values.retain(|binary| seen.insert(binary.path.clone()));
+    let mut deduped: Vec<NetworkBinary> = Vec::with_capacity(values.len());
+    for binary in std::mem::take(values) {
+        if let Some(existing) = deduped.iter_mut().find(|item| item.path == binary.path) {
+            if !is_advisor_proposed_binary(&binary) {
+                mark_user_declared_binary(existing);
+            }
+        } else {
+            deduped.push(binary);
+        }
+    }
+    *values = deduped;
+}
+
+fn is_advisor_proposed_binary(binary: &NetworkBinary) -> bool {
+    #[allow(deprecated)]
+    let advisor_proposed = binary.harness;
+    advisor_proposed
+}
+
+fn mark_user_declared_binary(binary: &mut NetworkBinary) {
+    #[allow(deprecated)]
+    {
+        binary.harness = false;
+    }
 }
 
 fn dedup_l7_rules(values: &mut Vec<L7Rule>) {
@@ -878,6 +907,18 @@ mod tests {
         }
     }
 
+    fn advisor_binary(path: &str) -> NetworkBinary {
+        let mut binary = NetworkBinary {
+            path: path.to_string(),
+            ..Default::default()
+        };
+        #[allow(deprecated)]
+        {
+            binary.harness = true;
+        }
+        binary
+    }
+
     fn rest_rule(method: &str, path: &str) -> L7Rule {
         L7Rule {
             allow: Some(L7Allow {
@@ -947,6 +988,131 @@ mod tests {
         assert_eq!(endpoint.enforcement, "enforce");
         assert_eq!(endpoint.rules.len(), 1);
         assert_eq!(rule.binaries.len(), 2);
+    }
+
+    #[test]
+    fn add_rule_user_binary_clears_advisor_marker_for_same_path() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![endpoint("api.github.com", 443)],
+                binaries: vec![advisor_binary("/usr/bin/curl")],
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let rule = &result.policy.network_policies["existing"];
+        assert_eq!(rule.binaries.len(), 1);
+        #[allow(deprecated)]
+        {
+            assert!(!rule.binaries[0].harness);
+        }
+    }
+
+    #[test]
+    fn add_rule_duplicate_binaries_prefer_user_declared_marker() {
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![
+                advisor_binary("/usr/bin/curl"),
+                NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let result = merge_policy(
+            restrictive_default_policy(),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "github".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let rule = &result.policy.network_policies["github"];
+        assert_eq!(rule.binaries.len(), 1);
+        #[allow(deprecated)]
+        {
+            assert!(!rule.binaries[0].harness);
+        }
+    }
+
+    #[test]
+    fn add_rule_preserves_advisor_endpoint_marker_when_binary_is_deduped() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "app-api".to_string(),
+            NetworkPolicyRule {
+                name: "app-api".to_string(),
+                endpoints: vec![endpoint("api.example.com", 443)],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "app-api".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "internal-admin.local".to_string(),
+                port: 443,
+                ports: vec![443],
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![advisor_binary("/usr/bin/python")],
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "app-api".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let rule = &result.policy.network_policies["app-api"];
+        assert_eq!(rule.binaries.len(), 1, "binary should still dedupe");
+        #[allow(deprecated)]
+        {
+            assert!(
+                !rule.binaries[0].harness,
+                "existing user binary provenance should be retained"
+            );
+        }
+        let internal_endpoint = rule
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.host == "internal-admin.local")
+            .expect("advisor endpoint should be appended");
+        assert!(
+            internal_endpoint.advisor_proposed,
+            "endpoint provenance must survive merge even when binary provenance is deduped"
+        );
     }
 
     #[test]

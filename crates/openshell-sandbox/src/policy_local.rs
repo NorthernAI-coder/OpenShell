@@ -1004,14 +1004,27 @@ fn network_rule_from_json(
     let endpoints = rule
         .endpoints
         .into_iter()
-        .map(network_endpoint_from_json)
+        .map(|endpoint| {
+            let mut endpoint = network_endpoint_from_json(endpoint)?;
+            endpoint.advisor_proposed = true;
+            Ok::<NetworkEndpoint, String>(endpoint)
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let binaries = rule
         .binaries
         .into_iter()
-        .map(|binary| NetworkBinary {
-            path: binary.path,
-            ..Default::default()
+        .map(|binary| {
+            let mut proposal_binary = NetworkBinary {
+                path: binary.path,
+                ..Default::default()
+            };
+            // The deprecated harness bit is ignored by policy YAML, but OPA
+            // maps it to advisor_proposed to preserve the SSRF two-step flow.
+            #[allow(deprecated)]
+            {
+                proposal_binary.harness = true;
+            }
+            proposal_binary
         })
         .collect();
 
@@ -1091,6 +1104,7 @@ fn network_endpoint_from_json(
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: false,
         request_body_credential_rewrite: false,
+        advisor_proposed: false,
         // GraphQL persisted-query knobs and path scoping default empty —
         // agent proposals don't author them today.
         persisted_queries: String::new(),
@@ -1339,6 +1353,10 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
+        #[allow(deprecated)]
+        {
+            assert!(rule.binaries[0].harness);
+        }
         assert_eq!(
             rule.endpoints[0].rules[0].allow.as_ref().unwrap().path,
             "/user/repos"
